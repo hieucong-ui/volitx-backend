@@ -1,0 +1,80 @@
+name: Backend CI/CD (No Artifact)
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  PROJECT_NAME: EV_Dealer_Management_System
+  DOTNET_VERSION: 9.0.x
+  EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+  EC2_HOST: ${{ secrets.EC2_HOST_PUBLIC }}
+  EC2_USER: ${{ secrets.EC2_USER }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: SWP391
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build project (Release)
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Publish project (framework-dependent)
+        run: dotnet publish -c Release -o ./publish
+
+      - name: Pack publish folder (tar.gz) + checksum
+        run: |
+          tar -C ./publish -czf publish.tgz .
+          sha256sum publish.tgz > publish.tgz.sha256
+          ls -lah
+          ls -lah publish.tgz*
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ env.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ env.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload & deploy to EC2
+        run: |
+          set -euo pipefail
+          test -f ./publish.tgz && test -f ./publish.tgz.sha256
+
+          HOST="${{ secrets.EC2_HOST_PUBLIC }}"
+          USER="${{ secrets.EC2_USER }}"
+
+          scp ./publish.tgz ./publish.tgz.sha256 "$USER@$HOST:/home/$USER/"
+
+          ssh -o StrictHostKeyChecking=no "$USER@$HOST" "set -euo pipefail
+            PROJECT='${{ env.PROJECT_NAME }}'
+            DEPLOY_DIR='/var/www/'\"\$PROJECT\"
+            SERVICE='kestrel-'\"\$PROJECT\"'.service'
+
+            sudo systemctl cat \"\$SERVICE\" >/dev/null 2>&1
+
+            cd /home/$USER
+            sha256sum -c publish.tgz.sha256
+
+            sudo mkdir -p \"\$DEPLOY_DIR/publish\"
+            sudo systemctl stop \"\$SERVICE\" || true
+            sudo rm -rf \"\$DEPLOY_DIR/publish\"/*
+            tar -xzf publish.tgz -C \"\$DEPLOY_DIR/publish\"
+            sudo chown -R ec2-user:ec2-user \"\$DEPLOY_DIR\"
+            sudo systemctl daemon-reload
+            sudo systemctl start \"\$SERVICE\"
+
+            rm -f publish.tgz publish.tgz.sha256
+          "
